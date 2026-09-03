@@ -1,0 +1,23 @@
+{
+  "name": "gagnant-promoters-platform",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Multi-tenant construction and interiors CMS platform — frontend (React/Vite) + backend (Express).",
+  "engines": {
+    "node": ">=18.18.0"
+  },
+  "scripts": {
+    "install:all": "npm install && npm install --prefix backend && npm install --prefix frontend",
+    "setup": "npm run install:all && npm run setup:env",
+    "setup:env": "node scripts/setup-env.js",
+    "dev": "concurrently -n BACKEND,FRONTEND -c blue,green \"npm run dev --prefix backend\" \"npm run dev --prefix frontend\"",
+    "backend": "npm run dev --prefix backend",
+    "frontend": "npm run dev --prefix frontend",
+    "build": "npm run build --prefix frontend",
+    "start": "npm run start --prefix backend"
+  },
+  "dependencies": {
+    "concurrently": "^9.1.2"
+  },
+  "devDependencies": {}
+}

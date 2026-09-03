@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+backend/node_modules/
+frontend/node_modules/
+
+# Environment files (never commit real secrets)
+.env
+backend/.env
+frontend/.env
+
+# Build output
+frontend/dist/
+
+# Runtime data (uploaded media — content itself lives in MongoDB Atlas)
+backend/uploads/
+
+# Logs / OS junk
+npm-debug.log*
+.DS_Store
+*.log
