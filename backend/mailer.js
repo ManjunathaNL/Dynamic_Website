@@ -9,7 +9,7 @@ let checked = false;
 function getTransporter() {
   if (checked) return transporter;
   checked = true;
-  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS } = process.env;
+  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_SECURE } = process.env;
   if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) {
     console.log("[mailer] SMTP not configured — lead email notifications are disabled. Set SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS in backend/.env to enable them.");
     return null;
@@ -17,7 +17,9 @@ function getTransporter() {
   transporter = nodemailer.createTransport({
     host: SMTP_HOST,
     port: Number(SMTP_PORT) || 587,
-    secure: Number(SMTP_PORT) === 465,
+    // SMTP_SECURE overrides the port-based guess when set — some providers
+    // run TLS-from-the-start ("secure") on ports other than 465.
+    secure: SMTP_SECURE != null ? SMTP_SECURE === "true" : Number(SMTP_PORT) === 465,
     auth: { user: SMTP_USER, pass: SMTP_PASS },
     connectionTimeout: 10000,
     greetingTimeout: 10000,
@@ -31,9 +33,12 @@ async function sendLeadNotification({ tenant, settings, lead }) {
   if (!mailer) return { sent: false, reason: "smtp-not-configured" };
   const to = settings?.contact?.email || process.env.LEAD_NOTIFY_TO;
   if (!to) return { sent: false, reason: "no-recipient" };
+  const fromAddress = process.env.SMTP_FROM || process.env.SMTP_USER;
+  const from = process.env.SMTP_FROM_NAME ? `"${process.env.SMTP_FROM_NAME}" <${fromAddress}>` : fromAddress;
+  const manageUrl = process.env.FRONTEND_URL ? `${process.env.FRONTEND_URL.replace(/\/$/, "")}/admin` : null;
   try {
     await mailer.sendMail({
-      from: process.env.SMTP_FROM || process.env.SMTP_USER,
+      from,
       to,
       subject: `New enquiry — ${tenant.name}: ${lead.name}`,
       text: [
@@ -45,7 +50,8 @@ async function sendLeadNotification({ tenant, settings, lead }) {
         `Source: ${lead.source || "website"}`,
         "",
         "Message:",
-        lead.message
+        lead.message,
+        ...(manageUrl ? ["", `Manage this enquiry: ${manageUrl}`] : [])
       ].join("\n")
     });
     return { sent: true };

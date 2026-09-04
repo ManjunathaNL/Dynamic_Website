@@ -3,6 +3,7 @@ const express = require("express");
 const path = require("path");
 const fs = require("fs");
 const jwt = require("jsonwebtoken");
+const bcrypt = require("bcryptjs");
 const helmet = require("helmet");
 const cors = require("cors");
 const compression = require("compression");
@@ -14,12 +15,29 @@ const { processMedia, safeUnlink, safeRename } = require("./media");
 const { sendLeadNotification } = require("./mailer");
 
 const app = express();
-const PORT = process.env.PORT || 8787;
+const PORT = process.env.PORT;
 const NODE_ENV = process.env.NODE_ENV || "development";
 const JWT_SECRET = process.env.JWT_SECRET || "local-development-secret-change-me";
 
 if (NODE_ENV === "production" && JWT_SECRET === "local-development-secret-change-me") {
   console.warn("\n⚠️  WARNING: JWT_SECRET is still the default value. Set a strong, random JWT_SECRET in backend/.env before going live.\n");
+}
+// APP_URL and CORS_ORIGIN default to values that only make sense on a
+// developer's own machine (see below). They're easy to forget when moving
+// from localhost to a real domain, and the failure is silent — sitemap.xml
+// keeps emitting localhost links, or the API keeps accepting requests from
+// anywhere — so call it out loudly at startup instead of leaving it to be
+// discovered later.
+// FRONTEND_URL (the public site's URL) doubles as a fallback for both APP_URL
+// and CORS_ORIGIN when they're not set separately — in this app's normal
+// single-server deployment the API and the site share the same domain, so
+// one URL is usually enough.
+if (!process.env.APP_URL && process.env.FRONTEND_URL) process.env.APP_URL = process.env.FRONTEND_URL;
+if (NODE_ENV === "production" && !process.env.APP_URL) {
+  console.warn("\n⚠️  WARNING: APP_URL is not set. sitemap.xml and robots.txt will fall back to http://localhost — set APP_URL (or FRONTEND_URL) to your real production domain (e.g. https://gagnantpromoters.com) in backend/.env.\n");
+}
+if (NODE_ENV === "production" && !process.env.CORS_ORIGIN && !process.env.FRONTEND_URL) {
+  console.warn("\n⚠️  WARNING: Neither CORS_ORIGIN nor FRONTEND_URL is set, so the API accepts requests from any origin. Set one of them to your real frontend domain(s) in backend/.env before going live.\n");
 }
 
 // Ceiling is generous (up to ~300MB source videos) — everything gets
@@ -37,7 +55,11 @@ app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(compression());
 if (NODE_ENV !== "test") app.use(morgan(NODE_ENV === "production" ? "combined" : "dev"));
 
-const allowedOrigins = (process.env.CORS_ORIGIN || "*").split(",").map((x) => x.trim()).filter(Boolean);
+const allowedOrigins = process.env.CORS_ORIGIN
+  ? process.env.CORS_ORIGIN.split(",").map((x) => x.trim()).filter(Boolean)
+  : process.env.FRONTEND_URL
+  ? [process.env.FRONTEND_URL.replace(/\/$/, "")]
+  : ["*"];
 app.use(cors({
   origin: allowedOrigins.includes("*") ? true : allowedOrigins,
   credentials: true
@@ -61,6 +83,14 @@ async function tenantFor(req) {
   return firstTenant?.id;
 }
 const tokenFor = (user) => jwt.sign({ id: user.id, email: user.email, role: user.role, tenantId: user.tenantId }, JWT_SECRET, { expiresIn: "8h" });
+const isBcryptHash = (value) => /^\$2[aby]\$/.test(value || "");
+// Accepts both a bcrypt hash (the normal case) and a plain-text password —
+// the latter only matters for accounts seeded before hashing was added, and
+// login() below transparently upgrades one to a hash on first successful use.
+async function verifyPassword(user, plain) {
+  if (!user || !plain) return false;
+  return isBcryptHash(user.password) ? bcrypt.compare(plain, user.password) : user.password === plain;
+}
 function auth(req, res, next) {
   const token = (req.headers.authorization || "").replace("Bearer ", "");
   if (!token) return res.status(401).json({ error: "Authentication required" });
@@ -78,8 +108,9 @@ const asyncRoute = (handler) => (req, res, next) => Promise.resolve(handler(req,
 app.get("/api/health", (_, res) => res.json({ ok: true, service: "gagnant-promoters-api", env: NODE_ENV, time: store.now() }));
 app.post("/api/auth/login", loginLimiter, asyncRoute(async (req, res) => {
   const { email, password } = req.body || {};
-  const user = await store.find("users", { email: { $regex: `^${escapeRegex(String(email || ""))}$`, $options: "i" }, password });
-  if (!user) return res.status(401).json({ error: "Invalid email or password" });
+  const user = await store.find("users", { email: { $regex: `^${escapeRegex(String(email || ""))}$`, $options: "i" } });
+  if (!user || !(await verifyPassword(user, password))) return res.status(401).json({ error: "Invalid email or password" });
+  if (!isBcryptHash(user.password)) await store.update("users", user.id, { password: await bcrypt.hash(password, 10) });
   res.json({ token: tokenFor(user), user: { id: user.id, name: user.name, email: user.email, role: user.role, tenantId: user.tenantId } });
 }));
 
@@ -87,9 +118,8 @@ app.post("/api/auth/login", loginLimiter, asyncRoute(async (req, res) => {
 app.get("/api/public/:slug/bootstrap", asyncRoute(async (req, res) => {
   const tenant = await store.find("tenants", { slug: req.params.slug, status: "active" });
   if (!tenant) return res.status(404).json({ error: "Tenant not found" });
-  const [settings, pages, services, projects, blogs, testimonials, clients, media] = await Promise.all([
+  const [settings, services, projects, blogs, testimonials, clients, media] = await Promise.all([
     store.find("settings", { tenantId: tenant.id }),
-    store.list("pages", tenant.id),
     store.list("services", tenant.id),
     store.list("projects", tenant.id),
     store.list("blogs", tenant.id),
@@ -97,7 +127,7 @@ app.get("/api/public/:slug/bootstrap", asyncRoute(async (req, res) => {
     store.list("clients", tenant.id),
     store.list("media", tenant.id)
   ]);
-  res.json({ tenant, settings, pages: visible(pages), services: visible(services), projects: visible(projects), blogs: visible(blogs), testimonials: visible(testimonials), clients: visible(clients), media });
+  res.json({ tenant, settings, services: visible(services), projects: visible(projects), blogs: visible(blogs), testimonials: visible(testimonials), clients: visible(clients), media });
 }));
 app.post("/api/public/:slug/leads", leadLimiter, asyncRoute(async (req, res) => {
   const tenant = await store.find("tenants", { slug: req.params.slug, status: "active" });
@@ -113,6 +143,24 @@ app.post("/api/public/:slug/leads", leadLimiter, asyncRoute(async (req, res) => 
 
 // --- Authenticated core ----------------------------------------------------
 app.get("/api/me", auth, (req, res) => res.json({ user: req.user }));
+// Self-service profile: update your own display name and/or password.
+// Changing the password requires the current one — this is not an admin
+// "reset someone else's password" endpoint, only "change my own".
+app.patch("/api/me", auth, asyncRoute(async (req, res) => {
+  const user = await store.find("users", { id: req.user.id });
+  if (!user) return res.status(404).json({ error: "User not found" });
+  const patch = {};
+  if (typeof req.body.name === "string" && req.body.name.trim()) patch.name = clean(req.body.name);
+  if (req.body.newPassword) {
+    if (!(await verifyPassword(user, req.body.currentPassword))) return res.status(401).json({ error: "Current password is incorrect" });
+    if (String(req.body.newPassword).length < 6) return res.status(400).json({ error: "New password must be at least 6 characters" });
+    patch.password = await bcrypt.hash(String(req.body.newPassword), 10);
+  }
+  if (!Object.keys(patch).length) return res.status(400).json({ error: "Nothing to update" });
+  const next = await store.update("users", user.id, patch);
+  await audit(req, "update", "profile", user.id, null, null);
+  res.json({ user: { id: next.id, name: next.name, email: next.email, role: next.role, tenantId: next.tenantId } });
+}));
 app.get("/api/tenants", auth, asyncRoute(async (req, res) => {
   res.json({ items: req.user.role === "super_admin" ? await store.list("tenants") : await store.list("tenants", req.user.tenantId) });
 }));
@@ -122,7 +170,7 @@ app.post("/api/tenants", auth, asyncRoute(async (req, res) => {
   if (!name || !slug) return res.status(400).json({ error: "Name and slug are required" });
   if (await store.find("tenants", { slug })) return res.status(409).json({ error: "Slug already exists" });
   const tenant = await store.create("tenants", { name: clean(name), slug: clean(slug).toLowerCase(), domain, status: "active" });
-  await store.create("settings", { tenantId: tenant.id, brand: { primary: "#c86b32", secondary: "#14221f", accent: "#e8b563", surface: "#f5f1e9", text: "#18201d", muted: "#67716c", radius: "18px", font: "Manrope", logoUrl: "", heroUrl: "" }, tagline: "Built for what matters.", contact: {}, social: {}, features: { blog: true, video: true, testimonials: true } });
+  await store.create("settings", { tenantId: tenant.id, brand: { primary: "#c86b32", secondary: "#14221f", accent: "#e8b563", surface: "#f5f1e9", text: "#18201d", muted: "#67716c", radius: "18px", font: "Manrope", logoUrl: "", heroUrl: "" }, tagline: "Built for what matters.", contact: {}, social: {}, features: { blog: true, video: true, testimonials: true }, seo: {} });
   await audit(req, "create", "tenant", tenant.id, null, tenant);
   res.status(201).json(tenant);
 }));
@@ -134,7 +182,7 @@ app.patch("/api/settings", auth, asyncRoute(async (req, res) => {
   // a caller sending only { brand: { heroImages: [...] } } should update just
   // that key, not blank out every other brand/contact/social field.
   const patch = { ...req.body };
-  for (const key of ["brand", "contact", "social", "features"]) {
+  for (const key of ["brand", "contact", "social", "features", "seo"]) {
     if (patch[key]) patch[key] = { ...current[key], ...patch[key] };
   }
   const next = await store.update("settings", current.id, patch);
@@ -189,7 +237,7 @@ async function clearFileReferences(url) {
   return refs;
 }
 
-const resources = ["pages", "services", "projects", "blogs", "testimonials", "clients"];
+const resources = ["services", "projects", "blogs", "testimonials", "clients"];
 resources.forEach((resource) => {
   app.get(`/api/${resource}`, auth, asyncRoute(async (req, res) => {
     let items = await store.list(resource, await tenantFor(req));
@@ -307,14 +355,24 @@ app.post("/api/media/batch", auth, uploadLimiter, upload.array("files", 20), asy
 app.get("/sitemap.xml", asyncRoute(async (req, res) => {
   const tenant = await store.find("tenants", { slug: req.query.tenant || "gagnant-promoters" });
   const base = process.env.APP_URL || `http://localhost:${PORT}`;
-  const [services, projects] = await Promise.all([
+  const [services, projects, blogs] = await Promise.all([
     store.list("services", tenant && tenant.id),
-    store.list("projects", tenant && tenant.id)
+    store.list("projects", tenant && tenant.id),
+    store.list("blogs", tenant && tenant.id)
   ]);
-  const routes = ["/", "/about", "/services", "/projects", "/contact", ...visible(services).map((x) => `/services/${x.slug}`), ...visible(projects).map((x) => `/projects/${x.slug}`)];
-  res.type("application/xml").send(`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${routes.map((r) => `<url><loc>${base}${r}</loc></url>`).join("")}</urlset>`);
+  const staticEntries = ["/", "/about", "/services", "/projects", "/blog", "/contact"].map((r) => ({ loc: r }));
+  const dynamicEntries = [
+    ...visible(services).map((x) => ({ loc: `/services/${x.slug}`, lastmod: x.updatedAt })),
+    ...visible(projects).map((x) => ({ loc: `/projects/${x.slug}`, lastmod: x.updatedAt })),
+    ...visible(blogs).map((x) => ({ loc: `/blog/${x.slug}`, lastmod: x.updatedAt }))
+  ];
+  const entries = [...staticEntries, ...dynamicEntries];
+  res.type("application/xml").send(`<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${entries.map((e) => `<url><loc>${base}${e.loc}</loc>${e.lastmod ? `<lastmod>${e.lastmod.slice(0, 10)}</lastmod>` : ""}</url>`).join("")}</urlset>`);
 }));
-app.get("/robots.txt", (_, res) => res.type("text/plain").send("User-agent: *\nAllow: /\nDisallow: /admin\n"));
+app.get("/robots.txt", (req, res) => {
+  const base = process.env.APP_URL || `http://localhost:${PORT}`;
+  res.type("text/plain").send(`User-agent: *\nAllow: /\nDisallow: /admin\n\nSitemap: ${base}/sitemap.xml\n`);
+});
 
 // --- Serve the built frontend (production) -----------------------------------
 const frontendDist = path.join(__dirname, "..", "frontend", "dist");
@@ -341,7 +399,7 @@ app.use((err, _req, res, _next) => {
 store.connect()
   .then(() => {
     app.listen(PORT, () => {
-      console.log(`Gagnant platform API listening on http://localhost:${PORT}`);
+      console.log(`Gagnant platform API listening on port ${PORT} (public URL: ${process.env.APP_URL || `http://localhost:${PORT}`})`);
       console.log(`Environment: ${NODE_ENV}`);
     });
   })

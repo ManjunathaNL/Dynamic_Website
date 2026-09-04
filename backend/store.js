@@ -18,7 +18,7 @@ const seed = {
   users: [{
     id: "user-super-admin",
     name: "Platform Administrator",
-    email: "admin@gagnantpromoters.com",
+    email: "info@gagnantpromoters.com",
     password: "admin123",
     role: "super_admin",
     tenantId: null,
@@ -52,9 +52,9 @@ const seed = {
     announcement: "",
     contact: { email: "", phone: "", whatsapp: "", address: "", hours: "" },
     social: { instagram: "", linkedin: "", facebook: "" },
-    features: { blog: true, video: true, testimonials: true }
+    features: { blog: true, video: true, testimonials: true },
+    seo: {}
   }],
-  pages: [],
   services: [],
   projects: [],
   blogs: [],
