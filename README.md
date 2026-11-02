@@ -83,11 +83,10 @@ The API key stays on the server — it is never sent to the browser.
 
 The site has six fixed pages — Home, About Us, Services, Projects, Blog and
 Contact Us. Nothing they display is written into the code: every word comes
-from the database via the sections above. A brand-new install starts empty;
-a site that existed before this change had its wording copied into the
-database once on upgrade (`backend/migrations.js`), so it kept looking the
-same and is now fully editable. Public pages refresh their data in the
-background, so admin edits show up without visitors reloading.
+from the database via the sections above, and the backend holds no copy of
+it. A brand-new install starts completely empty (no wording, colours or
+images) until it's filled in through the admin. Public pages refresh their
+data in the background, so admin edits show up without visitors reloading.
 
 Projects and Services each carry a `category` chosen from the lists under
 Website content → Categories — Projects on `/` and `/projects` are grouped
@@ -164,10 +163,12 @@ work on refresh. Deployment/hosting is handled outside this repo.
 ## Image cleanup
 
 There is no separate media library — images and videos are uploaded right
-where they're used, and the files on disk are kept in sync automatically:
-- Replacing or removing an image/video (a cover image, card photo, logo, banner slide, page banner…) deletes the old file.
+where they're used, and storage is kept in sync with what the site uses:
+- Replacing or removing an image/video (a cover image, card photo, logo, banner slide, page banner…) and saving deletes the old file and its media record from MongoDB.
+- Picking a different image, or removing one, *before* saving deletes the unsaved upload straight away; the saved image stays until you save, so cancelling a form never loses anything.
 - Deleting a service/project/blog post/card deletes its images too.
-- Either way a file is only deleted when nothing else still uses it (e.g. the same photo used as a cover and a banner slide stays until both are gone).
+- A file is only deleted when nothing else still uses it (e.g. the same photo used as a cover and a banner slide stays until both are gone).
+- A cleanup runs at start-up and every hour: uploads no content uses (e.g. a form closed without saving) are deleted once they're 6 hours old, and `backend/uploads` is emptied of anything that's already in MongoDB or unused, once it's an hour old.
 
 ## Media pipeline
 
@@ -181,8 +182,10 @@ resource. Uploaded media (logo, banners, page banners, photos, videos, PDFs)
 is stored in the database too, using GridFS (the `uploads.files` /
 `uploads.chunks` collections), so MongoDB alone holds the whole site — a
 server can be replaced or moved without copying any files. Files are served
-at the same `/uploads/<name>` URLs as before, with long-lived caching and
-byte-range support so videos stream and seek. On start, any file a media
+by the API at `/api/uploads/<name>` (and `/uploads/<name>`), with long-lived
+caching and byte-range support so videos stream and seek. Content stores the
+`/uploads/<name>` form; the site loads it through the API path, so images
+work behind any web server that forwards `/api` to the backend — no special
+rule for `/uploads` is needed. On start, any file a media
 record points at that still only exists in `backend/uploads` (from before
-this change) is copied into MongoDB once; the disk copy is left as a backup
-and can be deleted afterwards.
+this change) is copied into MongoDB once, and the disk copy is then removed.

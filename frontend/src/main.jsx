@@ -332,9 +332,14 @@ const has = (v) =>
 // never javascript: or data:.
 const SAFE_URL =
   /^(https?:\/\/[^\s<>"']+|\/(?!\/)[^\s<>"']*|mailto:[^\s<>"']+|tel:[+\d\s()-]+|#[\w-]*)$/i;
+// Uploaded media is stored as /uploads/<name> but lives in MongoDB and is
+// served by the API, so it's fetched through the API base — that works
+// whatever the web server in front does with other paths, and when the API
+// is on a domain of its own.
+const mediaUrl = (s) => (s.startsWith("/uploads/") ? `${API}${s}` : s);
 const safeUrl = (value) => {
   const s = String(value ?? "").trim();
-  return s && SAFE_URL.test(s) ? s : undefined;
+  return s && SAFE_URL.test(s) ? mediaUrl(s) : undefined;
 };
 const cssUrl = (value) => {
   const s = safeUrl(value);
@@ -1574,12 +1579,11 @@ function ContactSection({
   );
 }
 
-const absoluteUrl = (url) =>
-  !safeUrl(url)
-    ? undefined
-    : /^https?:\/\//.test(url)
-      ? url
-      : `${location.origin}${url}`;
+const absoluteUrl = (url) => {
+  const safe = safeUrl(url);
+  if (!safe) return undefined;
+  return /^https?:\/\//.test(safe) ? safe : `${location.origin}${safe}`;
+};
 
 function upsertMeta(attr, key, content) {
   if (!content) {
@@ -4240,7 +4244,7 @@ function ContentManager({ resource, items, categories = [], onSave, onDelete }) 
               {resource === "cards" ? (
                 <span className="row-icon row-avatar">
                   {item.photoUrl ? (
-                    <img src={item.photoUrl} alt="" />
+                    <img src={safeUrl(item.photoUrl)} alt="" />
                   ) : (
                     initialsOf(item.name)
                   )}
@@ -4784,6 +4788,15 @@ function LeadTable({ items, onUpdate, onDelete }) {
   );
 }
 
+// An image or video that's replaced or removed in a form is handed back to
+// the server straight away. The server deletes it only if no saved content
+// uses it — so an upload that was never saved goes at once, while the saved
+// one stays until the form is saved (which deletes it then) or cancelled.
+const discardUpload = (url) => {
+  if (String(url || "").startsWith("/uploads/"))
+    api("/media/discard", { method: "POST", body: JSON.stringify({ url }) }).catch(() => {});
+};
+
 function AssetUploadField({ label, hint, value, onChange, trim }) {
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -4803,6 +4816,7 @@ function AssetUploadField({ label, hint, value, onChange, trim }) {
         undefined,
         trim,
       );
+      if (value) discardUpload(value);
       onChange(result.url);
     } catch (err) {
       setError(err.message);
@@ -4819,7 +4833,7 @@ function AssetUploadField({ label, hint, value, onChange, trim }) {
       <div className="asset-upload-box">
         {value ? (
           <div className="asset-preview">
-            <img src={value} alt="" />
+            <img src={safeUrl(value)} alt="" />
           </div>
         ) : (
           <div className="asset-placeholder">
@@ -4845,7 +4859,10 @@ function AssetUploadField({ label, hint, value, onChange, trim }) {
             <button
               type="button"
               className="asset-remove"
-              onClick={() => onChange("")}
+              onClick={() => {
+                discardUpload(value);
+                onChange("");
+              }}
             >
               <Trash2 size={13} /> Remove
             </button>
@@ -5569,9 +5586,9 @@ function HeroSlidesField({ slides, onChange }) {
         {slides.map((slide, i) => (
           <div className="slide-thumb" key={`${slide.url}-${i}`}>
             {slide.type === "video" ? (
-              <video src={slide.url} muted preload="metadata" />
+              <video src={safeUrl(slide.url)} muted preload="metadata" />
             ) : (
-              <img src={slide.url} alt="" />
+              <img src={safeUrl(slide.url)} alt="" />
             )}
             <span className="slide-badge">
               {i + 1} · {slide.type === "video" ? "Video" : "Image"}
@@ -5580,7 +5597,10 @@ function HeroSlidesField({ slides, onChange }) {
               index={i}
               count={slides.length}
               onMove={(to) => onChange(move(slides, i, to))}
-              onRemove={() => onChange(slides.filter((_, j) => j !== i))}
+              onRemove={() => {
+                discardUpload(slide.url);
+                onChange(slides.filter((_, j) => j !== i));
+              }}
             />
           </div>
         ))}

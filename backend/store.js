@@ -36,9 +36,9 @@ async function bootstrapDatabase(database) {
   if (!(await database.collection("settings").findOne({ tenantId: tenant.id }))) {
     await database.collection("settings").insertOne({
       id: id(), tenantId: tenant.id, companyName: tenant.name, createdAt: now(), updatedAt: now(),
-      // Theme colours only (the site's default palette) — no copy.
-      brand: { primary: "#c86b32", secondary: "#14221f", accent: "#e8b563", surface: "#f5f1e9", text: "#18201d", muted: "#67716c", radius: "18px", font: "Manrope", logoUrl: "", heroUrl: "", heroImages: [] },
-      contact: {}, social: {}, seo: {}, pageBanners: {}, content: {}
+      // Empty: colours, logo, banners and every word are set in the admin
+      // (until then the stylesheet's own theme colours apply).
+      brand: { heroSlides: [] }, contact: {}, social: {}, seo: {}, pageBanners: {}, content: {}
     });
   }
   if ((await database.collection("users").countDocuments()) === 0) {
@@ -215,10 +215,11 @@ async function readFile(urlOrName) {
   for await (const chunk of openFile(file._id)) chunks.push(chunk);
   return Buffer.concat(chunks);
 }
+const listFiles = () => col("uploads.files").find({}, { projection: { filename: 1, uploadDate: 1, length: 1 } }).toArray();
 async function deleteFile(urlOrName) {
   const found = await col("uploads.files").find({ filename: uploadName(urlOrName) }, { projection: { _id: 1 } }).toArray();
   for (const file of found) await files().delete(file._id).catch(() => {});
   return found.length > 0;
 }
 
-module.exports = { connect, isConnected, list, create, update, remove, find, addAudit, query, count, increment, upsert, now, id, findFile, saveFile, openFile, readFile, deleteFile, UPLOAD_DIR, isCollectionLimitError, COLLECTION_LIMIT_HELP };
+module.exports = { connect, isConnected, list, create, update, remove, find, addAudit, query, count, increment, upsert, now, id, findFile, saveFile, openFile, readFile, deleteFile, listFiles, UPLOAD_DIR, isCollectionLimitError, COLLECTION_LIMIT_HELP };

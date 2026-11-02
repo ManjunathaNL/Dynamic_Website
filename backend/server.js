@@ -116,7 +116,10 @@ app.use("/api", security.sameOriginGuard(allowedOrigins));
 // get a hostile file stored, it can't run script or render as a page on this
 // site's origin. Byte ranges are supported so videos can stream and seek.
 // File names are random and never reused, so they're safe to cache hard.
-app.get("/uploads/:name", (req, res, next) => {
+// The same files answer at /api/uploads/<name>: the public site and admin
+// load them from there, so they're reachable whenever the API is — even
+// behind a web server that only forwards /api to this app.
+app.get(["/uploads/:name", "/api/uploads/:name"], (req, res, next) => {
   (async () => {
     if (!store.isConnected()) return res.set("Retry-After", "3").status(503).end();
     const file = await store.findFile(req.params.name);
@@ -990,10 +993,23 @@ async function findFileReferences(url) {
 // orphaned upload behind (there's no media library to tidy up by hand).
 async function deleteFileIfUnreferenced(url) {
   if (!url || !url.startsWith("/uploads/")) return;
-  if ((await findFileReferences(url)).length) return; // still in use elsewhere — keep it
+  if ((await referencedUploads()).has(path.basename(url))) return; // still in use elsewhere — keep it
   await removeStoredFile(url);
-  const mediaRecord = await store.find("media", { url });
-  if (mediaRecord) await store.remove("media", mediaRecord.id);
+  for (const record of await store.list("media")) if (record.url === url) await store.remove("media", record.id);
+}
+
+// Every uploaded file name any content still points at — found anywhere in
+// a record (image fields, banner lists, slide posters, text that embeds an
+// image), not just in the fields known to hold one.
+const CONTENT_COLLECTIONS = ["settings", "tenants", "services", "projects", "blogs", "testimonials", "clients", "cards"];
+async function referencedUploads() {
+  const names = new Set();
+  for (const resource of CONTENT_COLLECTIONS) {
+    for (const doc of await store.list(resource)) {
+      for (const match of JSON.stringify(doc).matchAll(/\/uploads\/([A-Za-z0-9._-]+)/g)) names.add(match[1]);
+    }
+  }
+  return names;
 }
 
 // Deletes an uploaded file from MongoDB, plus any copy still left on disk
@@ -1174,6 +1190,22 @@ app.delete("/api/media/:id", auth, asyncRoute(async (req, res) => {
   await audit(req, "delete", "media", current.id, current, null);
   res.json({ ok: true, clearedReferences });
 }));
+// The admin hands back an image/video that was replaced or removed in a
+// form. It's deleted only if no saved content uses it, so this can never
+// take away something the live site shows (saving the form deletes that).
+app.post("/api/media/discard", auth, asyncRoute(async (req, res) => {
+  const url = String(req.body?.url || "");
+  if (!/^\/uploads\/[A-Za-z0-9._-]+$/.test(url)) return res.status(400).json({ error: "Not an uploaded file" });
+  const record = await store.find("media", { url });
+  if (record && record.tenantId !== (await tenantFor(req))) return res.status(404).json({ error: "Not found" });
+  const inUse = (await referencedUploads()).has(path.basename(url));
+  if (!inUse) {
+    await deleteFileIfUnreferenced(url);
+    if (record) await audit(req, "delete", "media", record.id, record, null);
+  }
+  res.json({ ok: true, deleted: !inUse });
+}));
+
 // Shared by both the single-file and multi-file upload routes: verify and
 // compress/transcode the file, store it in MongoDB under a random name with
 // an extension that matches what it really is, and create its media record.
@@ -1337,9 +1369,60 @@ server.on("error", (error) => {
 server.headersTimeout = 30 * 1000;
 server.requestTimeout = 10 * 60 * 1000; // long enough for a large video upload
 
+// --- Storage housekeeping -----------------------------------------------------
+// Files are uploaded the moment they're picked in the admin, before the form
+// is saved — so picking a second image before saving, or closing the form,
+// leaves a file nothing uses. Saving already deletes a replaced or removed
+// file straight away; this sweep catches everything else. A file (and its
+// media record) that no content references is deleted once it's older than
+// the grace period, which keeps an upload waiting for "Save" safe. The
+// upload folder is only scratch space: anything in it that's already in
+// MongoDB, or that nothing references, goes once it's an hour old.
+const ORPHAN_GRACE_MS = 6 * 60 * 60 * 1000;
+const SCRATCH_MAX_AGE_MS = 60 * 60 * 1000;
+async function sweepStorage({ graceMs = ORPHAN_GRACE_MS } = {}) {
+  const used = await referencedUploads();
+  const cutoff = Date.now() - graceMs;
+  let files = 0;
+  let records = 0;
+  let scratch = 0;
+  const stored = await store.listFiles();
+  for (const file of stored) {
+    if (used.has(file.filename) || new Date(file.uploadDate).getTime() > cutoff) continue;
+    await store.deleteFile(file.filename);
+    files += 1;
+  }
+  for (const record of await store.list("media")) {
+    const name = path.basename(String(record.url || ""));
+    if (used.has(name) || new Date(record.createdAt || 0).getTime() > cutoff) continue;
+    await store.deleteFile(name);
+    await store.remove("media", record.id);
+    records += 1;
+  }
+  const inDatabase = new Set(stored.map((f) => f.filename));
+  for (const name of fs.existsSync(store.UPLOAD_DIR) ? fs.readdirSync(store.UPLOAD_DIR) : []) {
+    const filePath = path.join(store.UPLOAD_DIR, name);
+    const stat = fs.statSync(filePath, { throwIfNoEntry: false });
+    if (!stat?.isFile() || Date.now() - stat.mtimeMs < SCRATCH_MAX_AGE_MS) continue;
+    if (used.has(name) && !inDatabase.has(name)) continue; // never drop the only copy of a file in use
+    await safeUnlink(filePath);
+    scratch += 1;
+  }
+  console.log(files || records || scratch
+    ? `[storage] Cleanup done: removed ${files} unused file(s) and ${records} unused media record(s) from MongoDB, and ${scratch} file(s) from ${store.UPLOAD_DIR}.`
+    : "[storage] Cleanup done: nothing to remove.");
+  return { files, records, scratch };
+}
+function scheduleStorageSweep() {
+  const run = () => sweepStorage().catch((error) => console.error("[storage] Cleanup failed:", error.message));
+  run();
+  setInterval(run, 60 * 60 * 1000).unref();
+}
+
 async function connectDatabase(attempt = 1) {
   try {
     await store.connect();
+    scheduleStorageSweep();
   } catch (error) {
     if (!process.env.MONGO_URI) {
       console.error(`\n⚠️  ${error.message}\n`);
