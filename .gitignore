@@ -11,7 +11,7 @@ frontend/.env
 # Build output
 frontend/dist/
 
-# Runtime data (uploaded media — content itself lives in MongoDB Atlas)
+# Upload scratch space / pre-GridFS backups (all media is stored in MongoDB Atlas)
 backend/uploads/
 
 # Logs / OS junk

@@ -1,3 +1,7 @@
+const fs = require("fs");
+const path = require("path");
+const { pipeline } = require("stream/promises");
+
 // One-time data migrations, run on every start and idempotent.
 //
 // legacy-content: the public site used to have its wording (hero headline,
@@ -112,8 +116,33 @@ async function migrateLegacyContent(db) {
   }
 }
 
-async function runMigrations(db) {
+// local-uploads: uploaded images/videos used to be kept only as files on the
+// server's disk. They now live in MongoDB (GridFS bucket "uploads"), so the
+// database alone holds the whole site. Any file a media record points at that
+// is still only on disk is copied in once; the disk copy is left untouched as
+// a backup and can be deleted afterwards.
+const TYPE_BY_EXTENSION = { ".webp": "image/webp", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".gif": "image/gif", ".avif": "image/avif", ".tiff": "image/tiff", ".heic": "image/heic", ".mp4": "video/mp4", ".pdf": "application/pdf" };
+
+async function importLocalUploads(db, { uploads, uploadDir }) {
+  const media = await db.collection("media").find({ url: { $regex: "^/uploads/" } }).toArray();
+  let imported = 0;
+  const missing = [];
+  for (const record of media) {
+    const name = path.basename(record.url);
+    if (await db.collection("uploads.files").findOne({ filename: name }, { projection: { _id: 1 } })) continue;
+    const filePath = path.join(uploadDir, name);
+    if (!fs.existsSync(filePath)) { missing.push(name); continue; }
+    const contentType = record.type || TYPE_BY_EXTENSION[path.extname(name).toLowerCase()] || "application/octet-stream";
+    await pipeline(fs.createReadStream(filePath), uploads.openUploadStream(name, { metadata: { contentType, tenantId: record.tenantId || null } }));
+    imported += 1;
+  }
+  if (imported) console.log(`[migrations] Copied ${imported} uploaded file(s) from ${uploadDir} into MongoDB — images and videos are now served from the database.`);
+  if (missing.length) console.warn(`[migrations] ${missing.length} media record(s) point at a file that is neither in MongoDB nor in ${uploadDir}: ${missing.join(", ")}`);
+}
+
+async function runMigrations(db, options) {
   await migrateLegacyContent(db);
+  await importLocalUploads(db, options);
 }
 
 module.exports = { runMigrations };

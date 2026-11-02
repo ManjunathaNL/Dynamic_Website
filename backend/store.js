@@ -1,7 +1,14 @@
+const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
-const { MongoClient } = require("mongodb");
+const { pipeline } = require("stream/promises");
+const { MongoClient, GridFSBucket } = require("mongodb");
 
+// Uploaded media (images, videos, PDFs) is stored in MongoDB itself (GridFS
+// bucket "uploads"), so the database holds the whole site. UPLOAD_DIR is
+// only a scratch folder for files while they're being processed — and the
+// place older installs kept their uploads, which are copied into the
+// database once on start (migrations.js).
 const UPLOAD_DIR = process.env.UPLOAD_DIR ? path.resolve(process.env.UPLOAD_DIR) : path.join(__dirname, "uploads");
 const MONGO_URI = process.env.MONGO_URI;
 
@@ -57,6 +64,7 @@ async function bootstrapDatabase(database) {
 // Mongo's own `_id` is left as whatever the driver assigns.
 let client;
 let db;
+let bucket;
 let connectPromise;
 
 async function connect() {
@@ -96,11 +104,18 @@ async function connect() {
     await database.collection("users").createIndex({ email: 1 }).catch(() => {});
     await database.collection("users").createIndex({ resetTokenHash: 1 }, { sparse: true }).catch(() => {});
     await database.collection("audit").createIndex({ tenantId: 1, resource: 1, at: -1 }).catch(() => {});
+    await database.collection("uploads.files").createIndex({ filename: 1 }, { unique: true }).catch((error) => {
+      if (isCollectionLimitError(error)) console.error(`
+⚠️  [store] MongoDB refused to create the uploads (media file) collections: ${COLLECTION_LIMIT_HELP}
+`);
+    });
+    const uploads = new GridFSBucket(database, { bucketName: "uploads" });
     await bootstrapDatabase(database);
-    await require("./migrations").runMigrations(database);
+    await require("./migrations").runMigrations(database, { uploads, uploadDir: UPLOAD_DIR });
     // Only now is the store "connected" — requests wait (503) until the
     // bootstrap and migrations above have finished.
     db = database;
+    bucket = uploads;
     console.log(`[store] Connected to MongoDB (db: ${db.databaseName})`);
     return db;
   })().catch(async (error) => {
@@ -108,6 +123,7 @@ async function connect() {
     // instead of every later connect() returning this same rejected promise.
     connectPromise = null;
     db = null;
+    bucket = null;
     await client?.close().catch(() => {});
     throw error;
   });
@@ -172,4 +188,37 @@ async function upsert(resource, itemId, value) {
   return find(resource, { id: itemId });
 }
 
-module.exports = { connect, isConnected, list, create, update, remove, find, addAudit, query, count, increment, upsert, now, id, UPLOAD_DIR, isCollectionLimitError, COLLECTION_LIMIT_HELP };
+// --- Uploaded files (GridFS) -------------------------------------------------
+// Files are stored under the same name their public URL uses
+// (/uploads/<name>), so content records never need to know where a file lives.
+const uploadName = (urlOrName) => path.basename(String(urlOrName || ""));
+function files() {
+  if (!bucket) throw new Error("MongoDB is not connected yet — call store.connect() before using the store.");
+  return bucket;
+}
+async function findFile(urlOrName) {
+  return col("uploads.files").findOne({ filename: uploadName(urlOrName) });
+}
+// Store (or replace) a file from a path on disk.
+async function saveFile(urlOrName, sourcePath, { contentType, tenantId } = {}) {
+  const name = uploadName(urlOrName);
+  await deleteFile(name);
+  await pipeline(fs.createReadStream(sourcePath), files().openUploadStream(name, { metadata: { contentType, tenantId: tenantId || null } }));
+  return findFile(name);
+}
+// `range` is { start, end } with `end` exclusive, as GridFS expects.
+const openFile = (fileId, range) => files().openDownloadStream(fileId, range);
+async function readFile(urlOrName) {
+  const file = await findFile(urlOrName);
+  if (!file) return null;
+  const chunks = [];
+  for await (const chunk of openFile(file._id)) chunks.push(chunk);
+  return Buffer.concat(chunks);
+}
+async function deleteFile(urlOrName) {
+  const found = await col("uploads.files").find({ filename: uploadName(urlOrName) }, { projection: { _id: 1 } }).toArray();
+  for (const file of found) await files().delete(file._id).catch(() => {});
+  return found.length > 0;
+}
+
+module.exports = { connect, isConnected, list, create, update, remove, find, addAudit, query, count, increment, upsert, now, id, findFile, saveFile, openFile, readFile, deleteFile, UPLOAD_DIR, isCollectionLimitError, COLLECTION_LIMIT_HELP };

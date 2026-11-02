@@ -12,7 +12,7 @@ const morgan = require("morgan");
 const multer = require("multer");
 const rateLimit = require("express-rate-limit");
 const store = require("./store");
-const { processMedia, safeUnlink, safeRename, extensionFor } = require("./media");
+const { processMedia, safeUnlink, extensionFor } = require("./media");
 const mailer = require("./mailer");
 const { buildVCard } = require("./vcard");
 const { createReviewService } = require("./googleReviews");
@@ -111,17 +111,51 @@ app.use(express.json({ limit: "1mb" }));
 app.use(security.sanitizeRequest);
 app.use("/api", security.sameOriginGuard(allowedOrigins));
 
-// Uploaded files are served with a locked-down policy of their own: even if
-// someone managed to get a hostile file stored, it can't run script or
-// render as a page on this site's origin.
-app.use("/uploads", express.static(store.UPLOAD_DIR, {
-  maxAge: "7d",
-  dotfiles: "deny",
-  setHeaders: (res) => {
-    res.set("X-Content-Type-Options", "nosniff");
-    res.set("Content-Security-Policy", "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; sandbox");
-  }
-}));
+// Uploaded files are streamed out of MongoDB (GridFS — see store.js) and
+// served with a locked-down policy of their own: even if someone managed to
+// get a hostile file stored, it can't run script or render as a page on this
+// site's origin. Byte ranges are supported so videos can stream and seek.
+// File names are random and never reused, so they're safe to cache hard.
+app.get("/uploads/:name", (req, res, next) => {
+  (async () => {
+    if (!store.isConnected()) return res.set("Retry-After", "3").status(503).end();
+    const file = await store.findFile(req.params.name);
+    if (!file) return res.status(404).end();
+    const etag = `"${file._id}"`;
+    res.set({
+      "Content-Type": file.metadata?.contentType || "application/octet-stream",
+      "Cache-Control": "public, max-age=604800, immutable",
+      "ETag": etag,
+      "Last-Modified": new Date(file.uploadDate).toUTCString(),
+      "Accept-Ranges": "bytes",
+      "X-Content-Type-Options": "nosniff",
+      "Content-Security-Policy": "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; sandbox"
+    });
+    if (req.headers["if-none-match"] === etag) return res.status(304).end();
+    let start = 0;
+    let end = file.length - 1;
+    const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || "");
+    if (range && (range[1] || range[2])) {
+      if (range[1]) {
+        start = Number(range[1]);
+        if (range[2]) end = Math.min(end, Number(range[2]));
+      } else {
+        start = Math.max(0, file.length - Number(range[2]));
+      }
+      if (start > end) return res.set("Content-Range", `bytes */${file.length}`).status(416).end();
+      res.status(206).set("Content-Range", `bytes ${start}-${end}/${file.length}`);
+    }
+    res.set("Content-Length", String(Math.max(0, end - start + 1)));
+    if (req.method === "HEAD" || file.length === 0) return res.end();
+    const stream = store.openFile(file._id, { start, end: end + 1 });
+    stream.on("error", (error) => {
+      console.error(`[uploads] Could not stream ${file.filename}: ${error.message}`);
+      if (!res.headersSent) res.status(500).end(); else res.destroy(error);
+    });
+    req.on("close", () => stream.destroy());
+    stream.pipe(res);
+  })().catch(next);
+});
 // A missing upload is a 404 — not the website's index.html (which the SPA
 // catch-all further down would otherwise answer with, as a 200).
 app.use("/uploads", (_req, res) => res.status(404).end());
@@ -457,7 +491,7 @@ app.get("/api/public/:slug/cards/:cardSlug/vcard", asyncRoute(async (req, res) =
     card,
     company: { name: companyNameOf(tenant, settings), website: siteBase(req), address: settings.contact?.address, phone: settings.contact?.phone },
     cardUrl: `${siteBase(req)}/card/${card.slug}`,
-    uploadDir: store.UPLOAD_DIR
+    readUpload: store.readFile
   });
   store.increment("cards", card.id, "saves").catch(() => {});
   const fileName = slugify(card.name) || "contact";
@@ -957,10 +991,17 @@ async function findFileReferences(url) {
 async function deleteFileIfUnreferenced(url) {
   if (!url || !url.startsWith("/uploads/")) return;
   if ((await findFileReferences(url)).length) return; // still in use elsewhere — keep it
-  const filePath = path.join(store.UPLOAD_DIR, path.basename(url));
-  if (fs.existsSync(filePath)) await safeUnlink(filePath);
+  await removeStoredFile(url);
   const mediaRecord = await store.find("media", { url });
   if (mediaRecord) await store.remove("media", mediaRecord.id);
+}
+
+// Deletes an uploaded file from MongoDB, plus any copy still left on disk
+// from before uploads moved into the database.
+async function removeStoredFile(url) {
+  await store.deleteFile(url);
+  const filePath = path.join(store.UPLOAD_DIR, path.basename(url));
+  if (fs.existsSync(filePath)) await safeUnlink(filePath);
 }
 
 // Called when an image is deleted directly from the Media Library. Clears
@@ -1127,23 +1168,27 @@ app.patch("/api/media/:id", auth, asyncRoute(async (req, res) => {
 app.delete("/api/media/:id", auth, asyncRoute(async (req, res) => {
   const current = await store.find("media", { id: String(req.params.id), tenantId: await tenantFor(req) });
   if (!current) return res.status(404).json({ error: "Not found" });
-  const filePath = path.join(store.UPLOAD_DIR, path.basename(current.url || ""));
-  if (current.url && fs.existsSync(filePath)) await safeUnlink(filePath);
+  if (current.url) await removeStoredFile(current.url);
   await store.remove("media", current.id);
   const clearedReferences = current.url ? await clearFileReferences(current.url) : [];
   await audit(req, "delete", "media", current.id, current, null);
   res.json({ ok: true, clearedReferences });
 }));
 // Shared by both the single-file and multi-file upload routes: verify and
-// compress/transcode the file, store it under a random name with an
-// extension that matches what it really is, and create its media record.
+// compress/transcode the file, store it in MongoDB under a random name with
+// an extension that matches what it really is, and create its media record.
+// The working copies on disk are removed either way.
 async function ingestUploadedFile(file, { tenantId, alt, trim }) {
   const processed = await processMedia(file.path, store.UPLOAD_DIR, file.filename, file.mimetype, { trim });
   const safeName = `${file.filename}${extensionFor(processed)}`;
-  const finalPath = path.join(store.UPLOAD_DIR, safeName);
-  if (processed.outputPath !== finalPath) await safeRename(processed.outputPath, finalPath);
-  if (file.path !== finalPath && fs.existsSync(file.path)) await safeUnlink(file.path);
-  const compressedSize = fs.statSync(finalPath).size;
+  let compressedSize;
+  try {
+    compressedSize = fs.statSync(processed.outputPath).size;
+    await store.saveFile(safeName, processed.outputPath, { contentType: processed.mime, tenantId });
+  } finally {
+    await safeUnlink(processed.outputPath);
+    if (file.path !== processed.outputPath) await safeUnlink(file.path);
+  }
   return store.create("media", {
     tenantId, name: security.cleanText(file.originalname, 200), type: processed.mime,
     size: compressedSize, originalSize: file.size, compressed: processed.compressed,

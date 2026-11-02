@@ -2,8 +2,6 @@
 // button. 3.0 rather than 4.0 because it's what iOS Contacts, Android and
 // Outlook all import reliably; the photo is embedded as a small JPEG since
 // several phones ignore WebP (our upload format) inside a vCard.
-const fs = require("fs");
-const path = require("path");
 const sharp = require("sharp");
 
 const escapeValue = (value) =>
@@ -36,14 +34,12 @@ function fold(line) {
   return parts.join("\r\n ");
 }
 
-async function embeddedPhoto(photoUrl, uploadDir) {
+// `readUpload` returns an uploaded file's bytes (from MongoDB), or null.
+async function embeddedPhoto(photoUrl, readUpload) {
   if (!photoUrl || !photoUrl.startsWith("/uploads/")) return null;
-  const filePath = path.join(uploadDir, path.basename(photoUrl));
-  if (!fs.existsSync(filePath)) return null;
   try {
-    // Read into memory first so no file handle outlives this call (an open
-    // handle would block deleting the photo later, on Windows).
-    const source = await fs.promises.readFile(filePath);
+    const source = await readUpload(photoUrl);
+    if (!source) return null;
     const buffer = await sharp(source).rotate().resize(400, 400, { fit: "cover" }).jpeg({ quality: 78 }).toBuffer();
     return buffer.toString("base64");
   } catch {
@@ -51,7 +47,7 @@ async function embeddedPhoto(photoUrl, uploadDir) {
   }
 }
 
-async function buildVCard({ card, company, cardUrl, uploadDir }) {
+async function buildVCard({ card, company, cardUrl, readUpload }) {
   const nameParts = String(card.name || "").trim().split(/\s+/);
   const lastName = nameParts.length > 1 ? nameParts.pop() : "";
   const firstName = nameParts.join(" ");
@@ -76,7 +72,7 @@ async function buildVCard({ card, company, cardUrl, uploadDir }) {
     card.facebook && `X-SOCIALPROFILE;TYPE=facebook:${escapeValue(card.facebook)}`,
     card.bio && `NOTE:${escapeValue(card.bio)}`
   ].filter(Boolean);
-  const photo = await embeddedPhoto(card.photoUrl, uploadDir);
+  const photo = await embeddedPhoto(card.photoUrl, readUpload);
   if (photo) lines.push(`PHOTO;ENCODING=b;TYPE=JPEG:${photo}`);
   lines.push(`REV:${new Date().toISOString()}`, "END:VCARD");
   return lines.map(fold).join("\r\n") + "\r\n";

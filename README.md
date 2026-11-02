@@ -13,7 +13,7 @@ Dynamic_Website/
 │   ├── media.js         Image/video compression & transcoding
 │   ├── mailer.js        Optional SMTP lead-notification emails
 │   ├── .env.example     → copy to .env
-│   └── uploads/         (auto-created) uploaded media lives here
+│   └── uploads/         (auto-created) scratch space while uploads are processed
 ├── frontend/            React + Vite app
 │   ├── src/main.jsx     Public site + admin dashboard (single app, two views)
 │   ├── src/styles.css
@@ -136,7 +136,7 @@ REST/JSON, so the equivalent protections above are what apply here.)
 | `MAIL_OUTBOX_DIR` | Development only: save outgoing emails (lead alerts, welcome/reset emails) as files in this folder instead of sending them, to preview templates | *(empty)* |
 | `LEAD_NOTIFY_TO` | Fallback recipient for new-lead emails if a tenant has no contact email set (the site's Contact email, `info@gagnantpromoters.com`, is used first) | *(empty)* |
 | `GOOGLE_PLACES_API_KEY` | Optional fallback for Google reviews if no key is saved in the admin | *(empty)* |
-| `UPLOAD_DIR` | Where uploaded media is stored | `backend/uploads` |
+| `UPLOAD_DIR` | Scratch folder for uploads while they're processed (the files themselves are stored in MongoDB). Also where older installs kept their uploads — those are copied into MongoDB automatically on start | `backend/uploads` |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` / `ADMIN_NAME` | Creates the first admin account on an empty database (ignored once any admin exists) | *(empty)* |
 | `COMPANY_NAME` | Company name for a brand-new install (editable later in Brand & settings) | *(empty)* |
 | `COOKIE_SECURE` | Set to `false` only to test the production build over plain HTTP on a LAN | *(auto)* |
@@ -177,7 +177,12 @@ Videos up to 100 MB are transcoded with FFmpeg to MP4 (H.264/AAC, max width
 1280px, fast-start streaming); the upload ceiling is 110 MB.
 
 The database is MongoDB Atlas (`backend/store.js`), with one collection per
-resource. Uploaded media lives on local disk (`backend/uploads`); for a
-larger deployment, consider moving that to S3-compatible object storage —
-the content model is already tenant-scoped (`tenantId` on every record), so
-the storage adapter can change without touching the public site or admin UI.
+resource. Uploaded media (logo, banners, page banners, photos, videos, PDFs)
+is stored in the database too, using GridFS (the `uploads.files` /
+`uploads.chunks` collections), so MongoDB alone holds the whole site — a
+server can be replaced or moved without copying any files. Files are served
+at the same `/uploads/<name>` URLs as before, with long-lived caching and
+byte-range support so videos stream and seek. On start, any file a media
+record points at that still only exists in `backend/uploads` (from before
+this change) is copied into MongoDB once; the disk copy is left as a backup
+and can be deleted afterwards.
