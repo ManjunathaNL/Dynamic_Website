@@ -1,15 +1,15 @@
 {
   "name": "@gagnant/backend",
   "private": true,
-  "version": "1.0.0",
+  "version": "2.1.0",
   "description": "Gagnant Promoters platform API (Express + MongoDB Atlas)",
-  "main": "index.js",
+  "main": "server.js",
   "engines": {
     "node": ">=18.18.0"
   },
   "scripts": {
-    "dev": "node index.js",
-    "start": "node index.js"
+    "dev": "node server.js",
+    "start": "node server.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",

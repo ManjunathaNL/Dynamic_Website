@@ -2,67 +2,52 @@ const path = require("path");
 const crypto = require("crypto");
 const { MongoClient } = require("mongodb");
 
-const UPLOAD_DIR = path.join(__dirname, "uploads");
+const UPLOAD_DIR = process.env.UPLOAD_DIR ? path.resolve(process.env.UPLOAD_DIR) : path.join(__dirname, "uploads");
 const MONGO_URI = process.env.MONGO_URI;
+
+const COLLECTION_LIMIT_HELP = "the Atlas cluster has reached its collection limit (500 collections across all databases on the cluster). Free some up by dropping unused databases/collections in Atlas → Browse Collections, or point MONGO_URI at a cluster of its own.";
+const isCollectionLimitError = (error) => error?.code === 8000 && /cannot create a new collection/i.test(error.message || "");
 
 const id = () => crypto.randomUUID();
 const now = () => new Date().toISOString();
 
-// Only the bare minimum needed for the app to be usable on a brand-new
-// Atlas cluster: an account to log in with, and the one tenant the
-// frontend is hardcoded to request (see frontend/src/main.jsx's calls to
-// "/public/gagnant-promoters/bootstrap"). No demo services, projects,
-// blogs, testimonials, pages, tagline or contact details — that content
-// is entered for real through the admin dashboard.
-const seed = {
-  users: [{
-    id: "user-super-admin",
-    name: "Platform Administrator",
-    email: "info@gagnantpromoters.com",
-    password: "admin123",
-    role: "super_admin",
-    tenantId: null,
-    createdAt: now()
-  }],
-  tenants: [{
-    id: "tenant-gagnant",
-    name: "Gagnant Promoters",
-    slug: "gagnant-promoters",
-    status: "active",
-    domain: "",
-    createdAt: now()
-  }],
-  settings: [{
-    id: "settings-gagnant",
-    tenantId: "tenant-gagnant",
-    brand: {
-      primary: "#c86b32",
-      secondary: "#14221f",
-      accent: "#e8b563",
-      surface: "#f5f1e9",
-      text: "#18201d",
-      muted: "#67716c",
-      radius: "18px",
-      font: "Manrope",
-      logoUrl: "",
-      heroUrl: "",
-      heroImages: []
-    },
-    tagline: "",
-    announcement: "",
-    contact: { email: "", phone: "", whatsapp: "", address: "", hours: "" },
-    social: { instagram: "", linkedin: "", facebook: "" },
-    features: { blog: true, video: true, testimonials: true },
-    seo: {}
-  }],
-  services: [],
-  projects: [],
-  blogs: [],
-  testimonials: [],
-  leads: [],
-  media: [],
-  audit: []
-};
+// The collections the app uses (each gets a unique index on `id`).
+const COLLECTIONS = ["users", "tenants", "settings", "services", "cards", "reviewCache", "projects", "blogs", "testimonials", "clients", "leads", "media", "audit"];
+
+// No demo content and no built-in password: a brand-new database only gets
+// the structural records the app can't run without — the one tenant the
+// frontend renders (TENANT in frontend/src/main.jsx) with an empty settings
+// record — plus a first admin account taken from ADMIN_EMAIL /
+// ADMIN_PASSWORD in backend/.env. Everything else is entered in the admin.
+async function bootstrapDatabase(database) {
+  const tenants = database.collection("tenants");
+  let tenant = await tenants.findOne({ slug: "gagnant-promoters" });
+  if (!tenant) {
+    tenant = { id: "tenant-gagnant", name: process.env.COMPANY_NAME || "", slug: "gagnant-promoters", status: "active", domain: "", createdAt: now() };
+    await tenants.insertOne({ ...tenant });
+  }
+  if (!(await database.collection("settings").findOne({ tenantId: tenant.id }))) {
+    await database.collection("settings").insertOne({
+      id: id(), tenantId: tenant.id, companyName: tenant.name, createdAt: now(), updatedAt: now(),
+      // Theme colours only (the site's default palette) — no copy.
+      brand: { primary: "#c86b32", secondary: "#14221f", accent: "#e8b563", surface: "#f5f1e9", text: "#18201d", muted: "#67716c", radius: "18px", font: "Manrope", logoUrl: "", heroUrl: "", heroImages: [] },
+      contact: {}, social: {}, seo: {}, pageBanners: {}, content: {}
+    });
+  }
+  if ((await database.collection("users").countDocuments()) === 0) {
+    const { ADMIN_EMAIL, ADMIN_PASSWORD } = process.env;
+    if (!ADMIN_EMAIL || !ADMIN_PASSWORD) {
+      console.warn("\n⚠️  No admin account exists yet. Set ADMIN_EMAIL and ADMIN_PASSWORD in backend/.env and restart to create one.\n");
+      return;
+    }
+    const bcrypt = require("bcryptjs");
+    await database.collection("users").insertOne({
+      id: id(), name: process.env.ADMIN_NAME || "Administrator", email: ADMIN_EMAIL.trim().toLowerCase(),
+      password: await bcrypt.hash(ADMIN_PASSWORD, 12), role: "super_admin", tenantId: null, tokenVersion: 0, createdAt: now()
+    });
+    console.log(`[store] Created the first admin account (${ADMIN_EMAIL}). You can remove ADMIN_PASSWORD from backend/.env now.`);
+  }
+}
 
 // --- MongoDB Atlas connection -----------------------------------------------
 // The database is a set of collections (one per resource, mirroring the old
@@ -97,29 +82,38 @@ async function connect() {
       client = new MongoClient(MONGO_URI);
       await client.connect();
     }
-    db = client.db();
-    await Promise.all(Object.keys(seed).map((resource) => db.collection(resource).createIndex({ id: 1 }, { unique: true }).catch(() => {})));
-    await db.collection("tenants").createIndex({ slug: 1 }).catch(() => {});
-    await db.collection("users").createIndex({ email: 1 }).catch(() => {});
-    await seedIfEmpty();
-    console.log(`[store] Connected to MongoDB Atlas (db: ${db.databaseName})`);
+    const database = client.db();
+    // A shared Atlas cluster caps how many collections it may hold in total
+    // (500 on the free/shared tiers, across *every* database on it). Past
+    // that, a collection this app hasn't used yet can't be created and every
+    // save to it fails — say so loudly at startup instead of failing later.
+    const blocked = [];
+    await Promise.all(COLLECTIONS.map((resource) => database.collection(resource).createIndex({ id: 1 }, { unique: true }).catch((error) => {
+      if (isCollectionLimitError(error)) blocked.push(resource);
+    })));
+    if (blocked.length) console.error(`\n⚠️  [store] MongoDB refused to create the collection(s) ${blocked.join(", ")}: ${COLLECTION_LIMIT_HELP}\n`);
+    await database.collection("tenants").createIndex({ slug: 1 }).catch(() => {});
+    await database.collection("users").createIndex({ email: 1 }).catch(() => {});
+    await database.collection("users").createIndex({ resetTokenHash: 1 }, { sparse: true }).catch(() => {});
+    await database.collection("audit").createIndex({ tenantId: 1, resource: 1, at: -1 }).catch(() => {});
+    await bootstrapDatabase(database);
+    await require("./migrations").runMigrations(database);
+    // Only now is the store "connected" — requests wait (503) until the
+    // bootstrap and migrations above have finished.
+    db = database;
+    console.log(`[store] Connected to MongoDB (db: ${db.databaseName})`);
     return db;
-  })();
+  })().catch(async (error) => {
+    // Forget the failed attempt so the caller can retry with a fresh client,
+    // instead of every later connect() returning this same rejected promise.
+    connectPromise = null;
+    db = null;
+    await client?.close().catch(() => {});
+    throw error;
+  });
   return connectPromise;
 }
-
-// First-run only: populate empty collections with the same starter content
-// the old JSON file used to ship with, so a brand-new Atlas cluster isn't
-// blank. Collections that already have data (a real deployment) are left
-// untouched.
-async function seedIfEmpty() {
-  for (const [resource, items] of Object.entries(seed)) {
-    if (!items.length) continue;
-    const col = db.collection(resource);
-    const count = await col.countDocuments();
-    if (count === 0) await col.insertMany(items);
-  }
-}
+const isConnected = () => Boolean(db);
 
 function col(resource) {
   if (!db) throw new Error("MongoDB is not connected yet — call store.connect() before using the store.");
@@ -160,5 +154,22 @@ async function find(resource, filter) {
   return stripMongoId(doc);
 }
 async function addAudit(entry) { return create("audit", entry); }
+// Paged, sorted reads for long collections (audit log, email log).
+async function query(resource, filter, { sort = { _id: -1 }, skip = 0, limit = 50 } = {}) {
+  const docs = await col(resource).find(filter).sort(sort).skip(skip).limit(limit).toArray();
+  return docs.map(stripMongoId);
+}
+const count = (resource, filter) => col(resource).countDocuments(filter);
+// Atomic counter bump (e.g. a business card's view/save stats) — avoids the
+// read-modify-write race of update() when many visitors hit it at once.
+async function increment(resource, itemId, field, by = 1) {
+  await col(resource).updateOne({ id: itemId }, { $inc: { [field]: by } });
+}
+// Insert-or-replace by id, for single cached documents such as the latest
+// Google reviews snapshot for a tenant.
+async function upsert(resource, itemId, value) {
+  await col(resource).updateOne({ id: itemId }, { $set: { ...value, id: itemId, updatedAt: now() } }, { upsert: true });
+  return find(resource, { id: itemId });
+}
 
-module.exports = { connect, list, create, update, remove, find, addAudit, now, id, UPLOAD_DIR };
+module.exports = { connect, isConnected, list, create, update, remove, find, addAudit, query, count, increment, upsert, now, id, UPLOAD_DIR, isCollectionLimitError, COLLECTION_LIMIT_HELP };

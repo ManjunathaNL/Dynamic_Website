@@ -3,6 +3,11 @@ const fsp = require("fs/promises");
 const path = require("path");
 const { spawn } = require("child_process");
 const sharp = require("sharp");
+
+// libvips' operation cache keeps recently read files open; on Windows that
+// makes a just-processed upload impossible to delete or rename (EBUSY).
+// Every file is read once anyway, so the cache buys nothing here.
+sharp.cache(false);
 const ffmpegPath = require("ffmpeg-static");
 
 const IMAGE_TARGET_BYTES = 450 * 1024; // land inside the ~200KB-500KB band
@@ -58,9 +63,29 @@ async function readDimensions(filePath) {
   }
 }
 
+// A rejected upload: the file isn't what it claims to be (or is a type we
+// never serve, like SVG). Surfaces to the admin as a 400 with this message.
+function invalidUpload(message) {
+  const error = new Error(message);
+  error.status = 400;
+  return error;
+}
+
+const RASTER_FORMATS = { jpeg: ".jpg", png: ".png", webp: ".webp", gif: ".gif", avif: ".avif", tiff: ".tiff", heif: ".heic" };
+
 async function compressImage(inputPath, outputDir, baseName, { trim = false } = {}) {
   const outputPath = path.join(outputDir, `${baseName}.webp`);
   const originalSize = fs.statSync(inputPath).size;
+  // The browser-supplied MIME type is just a claim — decode the file to make
+  // sure it really is a raster image. SVG is refused outright: it can carry
+  // script, and it would be served from this site's own origin.
+  let meta;
+  try {
+    meta = await sharp(inputPath).metadata();
+  } catch {
+    throw invalidUpload("That file isn't a valid image.");
+  }
+  if (!RASTER_FORMATS[meta.format]) throw invalidUpload("Only JPEG, PNG, WebP, GIF, AVIF or HEIC images can be uploaded (SVG isn't allowed).");
   try {
     let dimension = 2400;
     let quality = 82;
@@ -92,11 +117,12 @@ async function compressImage(inputPath, outputDir, baseName, { trim = false } = 
     // untouched so the platform keeps working; compression just won't
     // happen until the environment issue is resolved.
     console.error("[media] Image compression failed, storing the original file instead:", error.message);
-    const extension = path.extname(inputPath) || ".jpg";
+    // Extension from the decoded format, never from the uploaded file name.
+    const extension = RASTER_FORMATS[meta.format];
     const fallbackPath = path.join(outputDir, `${baseName}${extension}`);
     fs.copyFileSync(inputPath, fallbackPath);
     const dims = await readDimensions(fallbackPath);
-    return { outputPath: fallbackPath, mime: `image/${extension.replace(".", "") || "jpeg"}`, compressed: false, originalSize, reason: "compression-failed", ...dims };
+    return { outputPath: fallbackPath, mime: `image/${meta.format}`, compressed: false, originalSize, reason: "compression-failed", ...dims };
   }
 }
 
@@ -128,9 +154,11 @@ function runFfmpeg(args) {
 
 async function transcodeVideo(inputPath, outputDir, baseName) {
   const outputPath = path.join(outputDir, `${baseName}.mp4`);
-  if (!ffmpegPath) return { outputPath: inputPath, mime: "video/mp4", compressed: false, reason: "ffmpeg unavailable" };
+  if (!ffmpegPath) throw invalidUpload("Video uploads are unavailable on this server (ffmpeg is missing).");
   const originalSize = fs.statSync(inputPath).size;
   const duration = await getDuration(inputPath);
+  // ffmpeg can't find a duration → it isn't a playable video file.
+  if (!duration) throw invalidUpload("That file isn't a valid video.");
 
   // Target a specific final file size by computing the bitrate that gets us
   // there given the clip's real duration, instead of a fixed CRF that could
@@ -187,8 +215,20 @@ async function transcodeVideo(inputPath, outputDir, baseName) {
 async function processMedia(inputPath, outputDir, baseName, mime, options = {}) {
   if (mime.startsWith("image/")) return compressImage(inputPath, outputDir, baseName, options);
   if (mime.startsWith("video/")) return transcodeVideo(inputPath, outputDir, baseName);
-  // PDFs and anything else: store as-is.
-  return { outputPath: inputPath, mime, compressed: false, originalSize: fs.statSync(inputPath).size };
+  if (mime === "application/pdf") {
+    // Real PDFs start with "%PDF-"; anything else (an HTML page renamed to
+    // .pdf, say) is refused rather than stored and served from this origin.
+    const handle = await fsp.open(inputPath, "r");
+    const { buffer } = await handle.read(Buffer.alloc(5), 0, 5, 0);
+    await handle.close();
+    if (buffer.toString("latin1") !== "%PDF-") throw invalidUpload("That file isn't a valid PDF.");
+    return { outputPath: inputPath, mime, extension: ".pdf", compressed: false, originalSize: fs.statSync(inputPath).size };
+  }
+  throw invalidUpload("Only images, videos and PDFs can be uploaded.");
 }
 
-module.exports = { processMedia, safeUnlink, safeRename };
+// The extension a processed file is stored with — always derived from what
+// the file was verified to be, never from the name it was uploaded under.
+const extensionFor = (processed) => processed.extension || (processed.mime === "video/mp4" ? ".mp4" : path.extname(processed.outputPath)) || ".bin";
+
+module.exports = { processMedia, safeUnlink, safeRename, extensionFor };
